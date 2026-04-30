@@ -58,13 +58,33 @@ header "Available drives"
 printf "  ${BLD}%-5s %-16s %-10s %s${RST}\n" "Num" "Device" "Size" "Model"
 printf "  %s\n" "------------------------------------------------"
 
+info "Raw /proc/partitions:"
+cat /proc/partitions | sed 's/^/  /'
+echo ""
+
 IDX=0
 DNAMES=""
 while read -r _maj _min BLOCKS NAME; do
-    echo "$NAME" | grep -qE '^[a-zA-Z]'       || continue   # skip header/blank
-    echo "$NAME" | grep -qE 'p[0-9]+$|[a-z][0-9]+$' && continue  # skip partitions
-    echo "$NAME" | grep -qE '^(loop|ram|sr|fd|dm)' && continue    # skip non-drives
+    # skip blank lines and the header line
+    [ -z "$NAME" ] && continue
+    [ "$NAME" = "name" ] && continue
+    # skip anything that isn't a plain block device name
     [ -b "/dev/$NAME" ] || continue
+    # skip partitions — a partition always has its parent disk name as a prefix
+    # e.g. sda1 has sda, nvme0n1p1 has nvme0n1, mmcblk0p1 has mmcblk0
+    IS_PART=0
+    for _CHK in $(cat /proc/partitions | awk '{print $4}'); do
+        [ "$_CHK" = "$NAME" ] && continue
+        case "$NAME" in
+            ${_CHK}p[0-9]*) IS_PART=1 ;;
+            ${_CHK}[0-9]*)  IS_PART=1 ;;
+        esac
+        [ "$IS_PART" = "1" ] && break
+    done
+    [ "$IS_PART" = "1" ] && continue
+    # skip loop, ram, sr, fd
+    case "$NAME" in loop*|ram*|sr*|fd*) continue ;; esac
+
     SIZE=$(hr "$BLOCKS")
     MODEL=""
     [ -r "/sys/block/$NAME/device/model" ] && \
@@ -75,7 +95,16 @@ while read -r _maj _min BLOCKS NAME; do
 "
 done < /proc/partitions
 
-[ "$IDX" -gt 0 ] || die "No drives found"
+if [ "$IDX" -eq 0 ]; then
+    warn "Automatic drive detection found nothing — listing all block devices:"
+    cat /proc/partitions | sed 's/^/  /'
+    echo ""
+    warn "Enter the full device name manually (e.g. sda, nvme0n1, vda):"
+    printf "${CYN}Device name (without /dev/): ${RST}"; read -r DNAME
+    [ -b "/dev/$DNAME" ] || die "/dev/$DNAME is not a block device"
+    IDX=1
+    DNAMES="$DNAME"
+fi
 echo ""
 
 while true; do
