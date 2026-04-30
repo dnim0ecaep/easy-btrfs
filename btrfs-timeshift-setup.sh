@@ -1,22 +1,29 @@
 #!/bin/sh
 # =============================================================================
 #  btrfs-timeshift-setup.sh
-#  Debian 13 (trixie) — Full BTRFS + Timeshift drive setup
+#  Debian 13 (trixie) — BTRFS subvolume + Timeshift setup
 #
-#  Run from installer TTY2 (Ctrl+Alt+F2, press Enter to activate shell)
-#  AFTER the Debian base system has been installed.
+#  Run this from the Debian installer TTY2 shell AFTER the installer has
+#  finished installing the base system but BEFORE rebooting.
 #
-#  What this does:
-#    1. Lists all whole drives with sizes — you pick one by number
-#    2. Wipes and partitions the drive: 500M EFI + rest BTRFS
-#    3. Formats both partitions
-#    4. Creates BTRFS subvolumes: @ @home @root @log @tmp @opt
-#    5. Mounts everything into /target
-#    6. Writes /target/etc/fstab with UUID-based entries
+#  How to get here:
+#    - During Debian install, partition your disk using the installer:
+#        * 500M  -> EFI partition  (FAT32)
+#        * rest  -> BTRFS partition (the installer creates @rootfs here)
+#    - Let the installer finish installing the base system
+#    - Press Ctrl+Alt+F2 to get to TTY2, press Enter to activate the shell
+#    - wget this script and run: sh btrfs-timeshift-setup.sh
 #
-#  Compatible with Debian installer busybox environment:
-#    - No lsblk, no mountpoint, no set -e/pipefail
-#    - Uses: fdisk, blkid, mkfs, btrfs, /proc/partitions, /proc/mounts
+#  What this script does:
+#    1. Shows all drives with sizes so you can identify your target disk
+#    2. You pick the disk — script auto-detects the EFI + BTRFS partitions
+#    3. Unmounts /target cleanly
+#    4. Mounts BTRFS top-level, renames @rootfs -> @
+#    5. Creates subvolumes: @home @root @log @tmp @opt
+#    6. Remounts all subvolumes into /target with noatime,compress=zstd
+#    7. Rewrites /target/etc/fstab with correct UUID-based entries
+#
+#  Busybox-compatible: no lsblk, no mountpoint, no set -e/pipefail
 # =============================================================================
 
 RED='\033[1;31m'
@@ -41,320 +48,251 @@ is_mounted() {
     grep -q " $1 " /proc/mounts 2>/dev/null
 }
 
-# Human-readable size from 1K blocks
 human_size() {
-    KBLOCKS="$1"
-    if [ "$KBLOCKS" -ge 1073741824 ] 2>/dev/null; then
-        printf "%dT" $(( KBLOCKS / 1073741824 ))
-    elif [ "$KBLOCKS" -ge 1048576 ] 2>/dev/null; then
-        printf "%dG" $(( KBLOCKS / 1048576 ))
-    elif [ "$KBLOCKS" -ge 1024 ] 2>/dev/null; then
-        printf "%dM" $(( KBLOCKS / 1024 ))
-    else
-        printf "%dK" "$KBLOCKS"
+    KB="$1"
+    if   [ "$KB" -ge 1073741824 ] 2>/dev/null; then printf "%dT" $(( KB / 1073741824 ))
+    elif [ "$KB" -ge 1048576    ] 2>/dev/null; then printf "%dG" $(( KB / 1048576 ))
+    elif [ "$KB" -ge 1024       ] 2>/dev/null; then printf "%dM" $(( KB / 1024 ))
+    else printf "%dK" "$KB"
     fi
 }
 
-# ── Root check ────────────────────────────────────────────────────────────────
+# ── Sanity ────────────────────────────────────────────────────────────────────
 [ "$(id -u)" -eq 0 ] || die "Must run as root"
-
-# ── Dependency check ──────────────────────────────────────────────────────────
-for cmd in fdisk mkfs.fat mkfs.btrfs btrfs blkid; do
-    command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
-done
+command -v btrfs  >/dev/null 2>&1 || die "btrfs command not found"
+command -v blkid  >/dev/null 2>&1 || die "blkid command not found"
 
 # =============================================================================
-#  STEP 1 — List whole drives and let user pick one
+#  STEP 1 — Show all whole drives with sizes
 # =============================================================================
-header "STEP 1 — Available drives"
+header "STEP 1 — Drives detected on this system"
 echo ""
-printf "  ${BLD}%-4s  %-12s  %-8s  %s${RST}\n" "Num" "Device" "Size" "Model"
-printf "  %s\n" "--------------------------------------------"
+printf "  ${BLD}%-5s %-14s %-8s %s${RST}\n" "Num" "Device" "Size" "Model"
+printf "  %s\n" "--------------------------------------------------"
 
 IDX=0
 DRIVE_LIST=""
 
-# Read whole disks only from /proc/partitions
-# A whole disk: name has no trailing digit after the device letters
-# (sda, sdb, nvme0n1, vda etc) — but nvme ends in digit so we match
-# any name that has NO partition suffix (no p1/p2 for nvme, no digit for sd)
 while read -r MAJ MIN BLOCKS NAME; do
-    # Skip header and blank
+    # Skip header / blank lines
     echo "$NAME" | grep -qE '^[a-z]' || continue
-    # Skip partitions: sda1, sdb2, nvme0n1p1, vda1 etc
+    # Skip partitions (end in digit after letter, or have p+digit suffix)
     echo "$NAME" | grep -qE 'p[0-9]+$|[a-z][0-9]+$' && continue
-    # Skip loop, ram, sr
-    echo "$NAME" | grep -qE '^(loop|ram|sr|fd)' && continue
-
+    # Skip non-drives
+    echo "$NAME" | grep -qE '^(loop|ram|sr|fd|dm-)' && continue
     DEV="/dev/${NAME}"
     [ -b "$DEV" ] || continue
 
     SIZE=$(human_size "$BLOCKS")
-
-    # Try to get model from sysfs
     MODEL=""
     if [ -f "/sys/block/${NAME}/device/model" ]; then
-        MODEL=$(cat "/sys/block/${NAME}/device/model" 2>/dev/null | tr -d '\n' | sed 's/  */ /g')
+        MODEL=$(tr -d '\n' < "/sys/block/${NAME}/device/model" 2>/dev/null)
     fi
 
     IDX=$(( IDX + 1 ))
-    printf "  ${CYN}%-4s${RST}  %-12s  %-8s  %s\n" "$IDX" "$DEV" "$SIZE" "${MODEL:-(no model info)}"
-    DRIVE_LIST="${DRIVE_LIST}${IDX}|${DEV}|${SIZE}
+    printf "  ${CYN}%-5s${RST} %-14s %-8s %s\n" \
+        "$IDX" "$DEV" "$SIZE" "${MODEL:-(no model info)}"
+    DRIVE_LIST="${DRIVE_LIST}${IDX}|${DEV}
 "
 done < /proc/partitions
 
 echo ""
+[ "$IDX" -gt 0 ] || die "No drives found in /proc/partitions"
 
-if [ "$IDX" -eq 0 ]; then
-    die "No drives detected in /proc/partitions. Cannot continue."
-fi
+# Also show partition details so they can see what the installer created
+printf "  ${BLD}Partition details:${RST}\n"
+printf "  %s\n" "--------------------------------------------------"
+while read -r MAJ MIN BLOCKS NAME; do
+    echo "$NAME" | grep -qE '^[a-z]' || continue
+    # Only partitions this time
+    echo "$NAME" | grep -qE 'p[0-9]+$|[a-z][0-9]+$' || continue
+    echo "$NAME" | grep -qE '^(loop|ram|sr|fd)' && continue
+    DEV="/dev/${NAME}"
+    [ -b "$DEV" ] || continue
+    SIZE=$(human_size "$BLOCKS")
+    FSTYPE=$(blkid -s TYPE  -o value "$DEV" 2>/dev/null || true)
+    printf "    %-16s %-8s %s\n" "$DEV" "$SIZE" "${FSTYPE:--}"
+done < /proc/partitions
+echo ""
 
 # =============================================================================
-#  STEP 2 — User picks the drive
+#  STEP 2 — Pick the target disk
 # =============================================================================
-header "STEP 2 — Select drive to partition"
+header "STEP 2 — Select the disk the installer used"
 echo ""
-warn "THIS WILL ERASE ALL DATA ON THE SELECTED DRIVE."
+echo "  Pick the disk that Debian was just installed onto."
+echo "  This is usually your largest drive or the one without the installer USB."
 echo ""
 
-CHOSEN_DEV=""
+CHOSEN_DISK=""
 while true; do
     printf "${CYN}Enter drive number (1-${IDX}): ${RST}"
     read -r INPUT
+    echo "$INPUT" | grep -qE '^[0-9]+$' || { warn "Enter a number"; continue; }
+    [ "$INPUT" -ge 1 ] && [ "$INPUT" -le "$IDX" ] 2>/dev/null || {
+        warn "Must be between 1 and $IDX"; continue; }
 
-    # Must be a number in range
-    if ! echo "$INPUT" | grep -qE '^[0-9]+$'; then
-        warn "Please enter a number"
-        continue
-    fi
-    if [ "$INPUT" -lt 1 ] || [ "$INPUT" -gt "$IDX" ] 2>/dev/null; then
-        warn "Number must be between 1 and $IDX"
-        continue
-    fi
-
-    # Resolve number to device
-    CHOSEN_DEV=$(echo "$DRIVE_LIST" | while IFS='|' read -r I DEV SZ; do
+    CHOSEN_DISK=$(echo "$DRIVE_LIST" | while IFS='|' read -r I DEV; do
         [ "$I" = "$INPUT" ] && printf "%s" "$DEV" && break
     done)
-
-    [ -n "$CHOSEN_DEV" ] || { warn "Could not resolve selection — try again"; continue; }
+    [ -n "$CHOSEN_DISK" ] || { warn "Could not resolve — try again"; continue; }
     break
 done
 
-CHOSEN_SIZE=$(echo "$DRIVE_LIST" | while IFS='|' read -r I DEV SZ; do
-    [ "$DEV" = "$CHOSEN_DEV" ] && printf "%s" "$SZ" && break
-done)
-
-echo ""
-printf "  ${BLD}Selected : ${CYN}%s${RST}  (%s)\n" "$CHOSEN_DEV" "$CHOSEN_SIZE"
-echo ""
-warn "ALL DATA ON $CHOSEN_DEV WILL BE PERMANENTLY DESTROYED."
-printf "${RED}Type YES in capitals to confirm: ${RST}"
-read -r CONFIRM
-[ "$CONFIRM" = "YES" ] || die "Aborted — drive not modified."
-
-# Derive partition names (nvme/mmcblk use p1/p2, others use 1/2)
-case "$CHOSEN_DEV" in
+# Auto-detect partition suffixes
+case "$CHOSEN_DISK" in
     /dev/nvme*|/dev/mmcblk*)
-        EFI_PART="${CHOSEN_DEV}p1"
-        BTRFS_PART="${CHOSEN_DEV}p2"
+        EFI_PART="${CHOSEN_DISK}p1"
+        BTRFS_PART="${CHOSEN_DISK}p2"
         ;;
     *)
-        EFI_PART="${CHOSEN_DEV}1"
-        BTRFS_PART="${CHOSEN_DEV}2"
+        EFI_PART="${CHOSEN_DISK}1"
+        BTRFS_PART="${CHOSEN_DISK}2"
         ;;
 esac
 
-# =============================================================================
-#  STEP 3 — Unmount anything using this drive
-# =============================================================================
-header "STEP 3 — Unmounting any existing mounts on $CHOSEN_DEV"
+echo ""
+info "Target disk  : $CHOSEN_DISK"
+info "EFI partition: $EFI_PART"
+info "BTRFS partition: $BTRFS_PART"
 
-for extra in /target/proc /target/sys /target/dev/pts /target/dev /target/run; do
-    if is_mounted "$extra"; then
-        info "Unmounting $extra"
-        umount -l "$extra" 2>/dev/null || true
-    fi
-done
+# Verify both partitions exist
+[ -b "$EFI_PART" ]   || die "EFI partition $EFI_PART not found. Did the installer partition this disk?"
+[ -b "$BTRFS_PART" ] || die "BTRFS partition $BTRFS_PART not found."
 
-# Unmount all partitions of this drive (reverse order)
-for MP in /target/boot/efi /target/home /target/root /target/var/log \
-          /target/tmp /target/opt /target /mnt; do
+# Warn if BTRFS partition doesn't look like btrfs
+BTRFS_FSTYPE=$(blkid -s TYPE -o value "$BTRFS_PART" 2>/dev/null || true)
+if [ "$BTRFS_FSTYPE" != "btrfs" ]; then
+    warn "$BTRFS_PART has type '${BTRFS_FSTYPE:-unknown}' — expected btrfs"
+    warn "Make sure you selected BTRFS as the filesystem during the Debian install"
+    printf "${YEL}Continue anyway? (yes/no): ${RST}"
+    read -r FORCE
+    [ "$FORCE" = "yes" ] || die "Aborted."
+fi
+
+echo ""
+printf "${YEL}Confirm: proceed with $CHOSEN_DISK? (yes/no): ${RST}"
+read -r CONFIRM
+[ "$CONFIRM" = "yes" ] || die "Aborted."
+
+# =============================================================================
+#  STEP 3 — Cleanly unmount /target
+# =============================================================================
+header "STEP 3 — Unmounting /target"
+
+for MP in /target/proc /target/sys /target/dev/pts /target/dev \
+          /target/run /target/boot/efi /target/home /target/root \
+          /target/var/log /target/tmp /target/opt /target; do
     if is_mounted "$MP"; then
         info "Unmounting $MP"
         umount "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
     fi
 done
-
-# Also unmount any partition on the chosen drive directly
-grep "^${CHOSEN_DEV}" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r | while read -r MP; do
-    info "Unmounting leftover: $MP"
-    umount "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
-done
-
-ok "Unmount complete"
-
-# =============================================================================
-#  STEP 4 — Partition the drive
-# =============================================================================
-header "STEP 4 — Partitioning $CHOSEN_DEV"
-info "Creating GPT partition table with:"
-info "  Partition 1 : 500M  EFI System (FAT32)"
-info "  Partition 2 : rest  Linux filesystem (BTRFS)"
-echo ""
-
-# Use fdisk with a heredoc — compatible with busybox fdisk
-# g = new GPT, n = new partition, t = type, w = write
-fdisk "$CHOSEN_DEV" <<FDISK_CMDS
-g
-n
-1
-
-+500M
-t
-1
-n
-2
-
-
-w
-FDISK_CMDS
-
-ok "Partition table written"
-
-# Give kernel a moment to register new partitions
-sleep 2
-
-# Force kernel re-read (busybox-safe)
-blockdev --rereadpt "$CHOSEN_DEV" 2>/dev/null || true
-sleep 1
-
-# Verify partitions exist
-[ -b "$EFI_PART" ]   || die "EFI partition $EFI_PART not found after partitioning"
-[ -b "$BTRFS_PART" ] || die "BTRFS partition $BTRFS_PART not found after partitioning"
-ok "Partitions confirmed: $EFI_PART  $BTRFS_PART"
-
-# =============================================================================
-#  STEP 5 — Format partitions
-# =============================================================================
-header "STEP 5 — Formatting partitions"
-
-info "Formatting $EFI_PART as FAT32 (EFI)..."
-mkfs.fat -F32 "$EFI_PART" || die "Failed to format EFI partition"
-ok "EFI partition formatted"
-
-info "Formatting $BTRFS_PART as BTRFS..."
-mkfs.btrfs -f "$BTRFS_PART" || die "Failed to format BTRFS partition"
-ok "BTRFS partition formatted"
-
-# =============================================================================
-#  STEP 6 — Create BTRFS subvolumes
-# =============================================================================
-header "STEP 6 — Creating BTRFS subvolumes"
-
 if is_mounted /mnt; then
     umount /mnt 2>/dev/null || umount -l /mnt 2>/dev/null || true
 fi
+ok "Unmount complete"
 
-mount "$BTRFS_PART" /mnt || die "Failed to mount $BTRFS_PART to /mnt"
-ok "Mounted $BTRFS_PART -> /mnt"
+# =============================================================================
+#  STEP 4 — Mount top-level BTRFS, rename @rootfs -> @
+# =============================================================================
+header "STEP 4 — Preparing BTRFS subvolumes"
 
-# If installer already created @rootfs, rename it; otherwise create @
-if [ -d /mnt/@rootfs ]; then
+mount -o subvolid=5 "$BTRFS_PART" /mnt || die "Failed to mount top-level BTRFS"
+ok "Mounted top-level BTRFS -> /mnt"
+
+info "Current subvolumes:"
+btrfs subvolume list /mnt | sed 's/^/  /'
+echo ""
+
+if [ -d /mnt/@rootfs ] && [ ! -d "/mnt/@" ]; then
     mv /mnt/@rootfs /mnt/@ || die "Failed to rename @rootfs -> @"
     ok "Renamed @rootfs -> @"
-elif [ ! -d "/mnt/@" ]; then
-    btrfs subvolume create /mnt/@ || die "Failed to create @ subvolume"
-    ok "Created subvolume @"
+elif [ -d "/mnt/@" ]; then
+    warn "Subvolume @ already exists — skipping rename"
+    [ -d /mnt/@rootfs ] && warn "@rootfs also exists — you may want to delete it later"
 else
-    warn "Subvolume @ already exists — skipping"
+    info "Contents of /mnt:"
+    ls /mnt
+    die "No @rootfs or @ subvolume found. Is $BTRFS_PART the right partition?"
 fi
+
+# =============================================================================
+#  STEP 5 — Create additional subvolumes
+# =============================================================================
+header "STEP 5 — Creating subvolumes"
 
 for SUBVOL in @home @root @log @tmp @opt; do
     if [ -d "/mnt/${SUBVOL}" ]; then
-        warn "Subvolume ${SUBVOL} already exists — skipping"
+        warn "${SUBVOL} already exists — skipping"
     else
         btrfs subvolume create "/mnt/${SUBVOL}" || die "Failed to create ${SUBVOL}"
-        ok "Created subvolume ${SUBVOL}"
+        ok "Created ${SUBVOL}"
     fi
 done
 
 echo ""
 info "All subvolumes:"
-btrfs subvolume list /mnt
-echo ""
+btrfs subvolume list /mnt | sed 's/^/  /'
 
 umount /mnt || die "Failed to unmount /mnt"
 
 # =============================================================================
-#  STEP 7 — Mount subvolumes into /target
+#  STEP 6 — Mount everything into /target
 # =============================================================================
-header "STEP 7 — Mounting subvolumes into /target"
+header "STEP 6 — Mounting subvolumes into /target"
 
-BTRFS_OPTS="noatime,compress=zstd"
+OPTS="noatime,compress=zstd"
 
 mkdir -p /target
-mount -o "${BTRFS_OPTS},subvol=@" "$BTRFS_PART" /target \
-    || die "Failed to mount @ -> /target"
-ok "Mounted @ -> /target"
+mount -o "${OPTS},subvol=@"     "$BTRFS_PART" /target          || die "Failed to mount @"
+ok "@ -> /target"
 
 mkdir -p /target/boot/efi /target/home /target/root \
-         /target/var/log /target/tmp /target/opt
+         /target/var/log  /target/tmp  /target/opt
 
-mount -o "${BTRFS_OPTS},subvol=@home" "$BTRFS_PART" /target/home \
-    || die "Failed to mount @home"
-ok "Mounted @home    -> /target/home"
+mount -o "${OPTS},subvol=@home" "$BTRFS_PART" /target/home     || die "Failed to mount @home"
+ok "@home -> /target/home"
 
-mount -o "${BTRFS_OPTS},subvol=@root" "$BTRFS_PART" /target/root \
-    || die "Failed to mount @root"
-ok "Mounted @root    -> /target/root"
+mount -o "${OPTS},subvol=@root" "$BTRFS_PART" /target/root     || die "Failed to mount @root"
+ok "@root -> /target/root"
 
-mount -o "${BTRFS_OPTS},subvol=@log"  "$BTRFS_PART" /target/var/log \
-    || die "Failed to mount @log"
-ok "Mounted @log     -> /target/var/log"
+mount -o "${OPTS},subvol=@log"  "$BTRFS_PART" /target/var/log  || die "Failed to mount @log"
+ok "@log  -> /target/var/log"
 
-mount -o "${BTRFS_OPTS},subvol=@tmp"  "$BTRFS_PART" /target/tmp \
-    || die "Failed to mount @tmp"
-ok "Mounted @tmp     -> /target/tmp"
+mount -o "${OPTS},subvol=@tmp"  "$BTRFS_PART" /target/tmp      || die "Failed to mount @tmp"
+ok "@tmp  -> /target/tmp"
 
-mount -o "${BTRFS_OPTS},subvol=@opt"  "$BTRFS_PART" /target/opt \
-    || die "Failed to mount @opt"
-ok "Mounted @opt     -> /target/opt"
+mount -o "${OPTS},subvol=@opt"  "$BTRFS_PART" /target/opt      || die "Failed to mount @opt"
+ok "@opt  -> /target/opt"
 
-mount "$EFI_PART" /target/boot/efi \
-    || die "Failed to mount EFI partition"
-ok "Mounted EFI      -> /target/boot/efi"
+mount "$EFI_PART" /target/boot/efi                              || die "Failed to mount EFI"
+ok "EFI  -> /target/boot/efi"
 
 # =============================================================================
-#  STEP 8 — Write /target/etc/fstab
+#  STEP 7 — Rewrite /target/etc/fstab
 # =============================================================================
-header "STEP 8 — Writing /target/etc/fstab"
+header "STEP 7 — Writing /target/etc/fstab"
 
 BTRFS_UUID=$(blkid -s UUID -o value "$BTRFS_PART" 2>/dev/null)
-EFI_UUID=$(blkid -s UUID -o value "$EFI_PART" 2>/dev/null)
+EFI_UUID=$(blkid   -s UUID -o value "$EFI_PART"   2>/dev/null)
 
 [ -n "$BTRFS_UUID" ] || die "Could not get UUID for $BTRFS_PART"
-[ -n "$EFI_UUID" ]   || die "Could not get UUID for $EFI_PART"
+[ -n "$EFI_UUID"   ] || die "Could not get UUID for $EFI_PART"
 
-info "BTRFS UUID : $BTRFS_UUID"
-info "EFI UUID   : $EFI_UUID"
-
-mkdir -p /target/etc
+info "BTRFS UUID: $BTRFS_UUID"
+info "EFI UUID  : $EFI_UUID"
 
 FSTAB="/target/etc/fstab"
-[ -f "$FSTAB" ] && cp "$FSTAB" "${FSTAB}.bak" && info "Backed up old fstab to ${FSTAB}.bak"
+[ -f "$FSTAB" ] && cp "$FSTAB" "${FSTAB}.bak" && info "Old fstab backed up to ${FSTAB}.bak"
 
 cat > "$FSTAB" <<FSTAB
 # /etc/fstab: static file system information.
 #
-# Use 'blkid' to print the universally unique identifier for a
-# device; this may be used with UUID= as a more robust way to name
-# devices that works even if disks are added and removed. See fstab(5).
+# Use 'blkid' to print the universally unique identifier for a device.
+# See fstab(5) and systemd.mount(5) for details.
 #
-# systemd generates mount units based on this file, see systemd.mount(5).
-# Please run 'systemctl daemon-reload' after making changes here.
-#
-# <file system>                              <mount point>   <type>   <options>                       <dump>  <pass>
+# <file system>                             <mount point>  <type>  <options>                       <dump>  <pass>
 
 # / was on ${BTRFS_PART} during installation
 UUID=${BTRFS_UUID}  /            btrfs  noatime,compress=zstd,subvol=@       0  0
@@ -370,39 +308,32 @@ FSTAB
 
 ok "fstab written"
 echo ""
-info "Contents of new fstab:"
-printf "  %s\n" "------------------------------------------------------"
 cat "$FSTAB" | sed 's/^/  /'
-printf "  %s\n" "------------------------------------------------------"
 
 # =============================================================================
-#  STEP 9 — Summary
+#  STEP 8 — Summary
 # =============================================================================
-header "STEP 9 — Verification"
-
+header "STEP 8 — Done"
 echo ""
-info "Active mounts under /target:"
-grep "/target" /proc/mounts | awk '{printf "  %-35s -> %s\n", $1, $2}'
-
+info "Active mounts:"
+grep "target" /proc/mounts | awk '{printf "  %-35s %s\n", $1, $2}'
 echo ""
-info "BTRFS subvolumes on $BTRFS_PART:"
+info "BTRFS subvolumes:"
 btrfs subvolume list /target | sed 's/^/  /'
-
 echo ""
 ok "============================================================"
-ok "  Drive setup complete and ready for Timeshift!"
+ok "  Setup complete — system is ready for Timeshift!"
 ok "============================================================"
 echo ""
-printf "  ${BLD}Drive   :${RST} %s\n"  "$CHOSEN_DEV"
-printf "  ${BLD}EFI     :${RST} %s  (UUID: %s)\n" "$EFI_PART" "$EFI_UUID"
-printf "  ${BLD}BTRFS   :${RST} %s  (UUID: %s)\n" "$BTRFS_PART" "$BTRFS_UUID"
-printf "  ${BLD}Subvols :${RST} @  @home  @root  @log  @tmp  @opt\n"
+printf "  ${BLD}Disk   :${RST} %s\n"           "$CHOSEN_DISK"
+printf "  ${BLD}EFI    :${RST} %s  UUID: %s\n" "$EFI_PART"   "$EFI_UUID"
+printf "  ${BLD}BTRFS  :${RST} %s  UUID: %s\n" "$BTRFS_PART" "$BTRFS_UUID"
+printf "  ${BLD}Subvols:${RST} @  @home  @root  @log  @tmp  @opt\n"
 echo ""
-warn "Next steps:"
+warn "NEXT STEPS:"
 printf "  1. Press Ctrl+Alt+F1 to return to the Debian installer\n"
-printf "  2. Complete the installation normally\n"
-printf "  3. After first boot: install timeshift, select BTRFS mode\n"
-printf "     Timeshift will auto-detect all subvolumes\n"
+printf "  2. Let the installer finish (it may update GRUB / initramfs)\n"
+printf "  3. Reboot into your new Debian system\n"
+printf "  4. Install timeshift, open it, select BTRFS mode\n"
+printf "     Timeshift will auto-detect all @ subvolumes\n"
 echo ""
-
-
