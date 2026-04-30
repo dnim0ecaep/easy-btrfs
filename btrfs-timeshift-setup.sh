@@ -1,22 +1,21 @@
 #!/bin/sh
 # btrfs-timeshift-wizard.sh
 # ---------------------------------------------------------------
-# Run from the Debian 13 installer's shell (Alt-F2 during install).
-# Interactive wizard that prepares a drive for a Timeshift-compatible
-# BTRFS subvolume layout, then hands back to the installer.
+# Run from the Debian 13 installer's Alt-F2 shell — even at the
+# earliest stage where lsblk, parted, mkfs.vfat etc. are NOT yet
+# loaded. The script auto-installs the required udebs via anna-install.
+#
+# REQUIRES: network already configured in d-i (you wgetted this
+# script, so that's already true).
 #
 # Workflow:
-#   1. Boot Debian installer, start install normally
-#   2. When you reach (or before) the partitioning step, press Alt-F2
-#   3. Press Enter to activate the console
-#   4. Fetch and run this script:
-#         wget <url>/btrfs-timeshift-wizard.sh
-#         sh btrfs-timeshift-wizard.sh
-#   5. Pick drive, confirm, let it run
-#   6. Press Alt-F1 to return to the installer
-#   7. In the partitioner: choose "Manual", assign existing partitions
+#   1. Alt-F2 from the installer (any time after network is up)
+#   2. wget <url>/btrfs-timeshift-wizard.sh
+#   3. sh btrfs-timeshift-wizard.sh
+#   4. Pick drive, confirm, wait
+#   5. Alt-F1, return to installer, do Manual partitioning
 #
-# POSIX sh, busybox-safe. No bashisms. No colors (d-i tty is plain).
+# POSIX sh, busybox-safe.
 # ---------------------------------------------------------------
 
 set -eu
@@ -31,7 +30,7 @@ info()  { echo "[*] $*"; }
 warn()  { echo "[!] $*" >&2; }
 banner(){ echo; echo "=== $* ==="; }
 
-# ---- subcommand: fixfstab (run after d-i base install) --------
+# ---- subcommand: fixfstab (post base-install) -----------------
 if [ "${1:-}" = "fixfstab" ]; then
     [ "$(id -u)" = "0" ] || die "must run as root"
     [ -f "$STATE" ] || die "no state file at $STATE — run the wizard first"
@@ -40,39 +39,35 @@ if [ "${1:-}" = "fixfstab" ]; then
     [ -d "$TARGET" ] || die "$TARGET does not exist — run after d-i base install"
 
     info "rewriting $TARGET/etc/fstab"
-    if [ ! -f "$WORK/fstab.snippet" ]; then
-        die "missing $WORK/fstab.snippet — re-run the wizard"
-    fi
+    [ -f "$WORK/fstab.snippet" ] || die "missing $WORK/fstab.snippet"
     cp "$TARGET/etc/fstab" "$TARGET/etc/fstab.bak.$(date +%s)" 2>/dev/null || true
     cp "$WORK/fstab.snippet" "$TARGET/etc/fstab"
     sed 's/^/    /' "$TARGET/etc/fstab"
 
-    # Make sure the auxiliary mount points exist inside target
     info "creating mount points inside $TARGET"
     for d in home root srv tmp var/log var/cache .snapshots boot/efi; do
         mkdir -p "$TARGET/$d"
     done
 
-    # Mount the aux subvolumes now so any remaining d-i steps see them
     OPTS="defaults,noatime,compress=zstd:3,space_cache=v2"
     for pair in "@home:/home" "@root:/root" "@srv:/srv" "@tmp:/tmp" \
                 "@log:/var/log" "@cache:/var/cache" "@snapshots:/.snapshots"; do
         sv=$(echo "$pair" | cut -d: -f1)
         mp=$(echo "$pair" | cut -d: -f2)
-        mountpoint -q "$TARGET$mp" 2>/dev/null && continue
-        mount -o "${OPTS},subvol=${sv}" "$ROOT_PART" "$TARGET$mp" \
-            && info "  mounted $sv -> $TARGET$mp" \
-            || warn "  failed to mount $sv -> $TARGET$mp (non-fatal)"
+        grep -q " $TARGET$mp " /proc/mounts 2>/dev/null && continue
+        if mount -o "${OPTS},subvol=${sv}" "$ROOT_PART" "$TARGET$mp" 2>/dev/null; then
+            info "  mounted $sv -> $TARGET$mp"
+        else
+            warn "  failed to mount $sv -> $TARGET$mp"
+        fi
     done
 
     cat <<EOF
 
 ================================================================
-  fstab fixed.
-  Backup of original (if any): $TARGET/etc/fstab.bak.*
+  fstab fixed.  Backup: $TARGET/etc/fstab.bak.*
   Aux subvolumes mounted under $TARGET.
-
-  Return to the installer (Alt-F1) and finish the install.
+  Return to installer (Alt-F1) and finish.
 ================================================================
 EOF
     exit 0
@@ -81,21 +76,66 @@ fi
 # ---- preflight ------------------------------------------------
 [ "$(id -u)" = "0" ] || die "must run as root"
 
-# d-i loads partman-btrfs udeb when btrfs is selected as a fs type;
-# if the user hasn't done that yet, btrfs tools aren't present.
-missing=""
-for c in lsblk parted wipefs mkfs.vfat mkfs.btrfs btrfs blkid mount umount partprobe; do
-    command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
-done
-if [ -n "$missing" ]; then
-    warn "missing tools:$missing"
-    warn "in the installer, go back to the partitioner step once and pick"
-    warn "'btrfs' as a filesystem on any partition — this loads the btrfs"
-    warn "udeb. Then cancel out, return here (Alt-F2), and re-run."
-    die  "required tools not available yet"
+# ---- step 0: load required udebs ------------------------------
+banner "Step 0 of 3: Loading required d-i components"
+
+need_udebs=""
+add_udeb() {
+    case " $need_udebs " in
+        *" $1 "*) ;;
+        *) need_udebs="$need_udebs $1" ;;
+    esac
+}
+
+# Check each tool, queue its udeb if missing
+command -v lsblk      >/dev/null 2>&1 || add_udeb util-linux-udeb
+command -v blkid      >/dev/null 2>&1 || add_udeb util-linux-udeb
+command -v wipefs     >/dev/null 2>&1 || add_udeb util-linux-udeb
+command -v parted     >/dev/null 2>&1 || add_udeb parted-udeb
+command -v partprobe  >/dev/null 2>&1 || add_udeb parted-udeb
+command -v mkfs.vfat  >/dev/null 2>&1 || add_udeb dosfstools-udeb
+command -v mkfs.btrfs >/dev/null 2>&1 || add_udeb partman-btrfs
+command -v btrfs      >/dev/null 2>&1 || add_udeb partman-btrfs
+
+if [ -n "$need_udebs" ]; then
+    info "missing tools detected, fetching udebs:$need_udebs"
+
+    if ! command -v anna-install >/dev/null 2>&1; then
+        die "anna-install not present — must run inside the Debian installer"
+    fi
+
+    # Verify network is actually up
+    has_route=0
+    if command -v ip >/dev/null 2>&1; then
+        ip route 2>/dev/null | grep -q '^default' && has_route=1
+    fi
+    if [ "$has_route" = "0" ] && command -v route >/dev/null 2>&1; then
+        route -n 2>/dev/null | grep -q '^0\.0\.0\.0' && has_route=1
+    fi
+    [ "$has_route" = "1" ] || die "no default route — configure network in installer first (main menu -> Configure the network)"
+
+    for u in $need_udebs; do
+        info "  anna-install $u"
+        if ! anna-install "$u" >/tmp/anna.log 2>&1; then
+            warn "anna-install $u failed; log:"
+            cat /tmp/anna.log >&2
+            die "could not load $u"
+        fi
+    done
+
+    # Verify
+    still_missing=""
+    for t in lsblk wipefs blkid parted partprobe mkfs.vfat mkfs.btrfs btrfs; do
+        command -v "$t" >/dev/null 2>&1 || still_missing="$still_missing $t"
+    done
+    [ -z "$still_missing" ] || die "still missing after udeb install:$still_missing"
+    info "all required tools now available"
+else
+    info "all required tools already present"
 fi
 
 # ---- step 1: list drives --------------------------------------
+echo
 echo "================================================================"
 echo "  Debian 13 BTRFS + Timeshift Drive Preparation Wizard"
 echo "================================================================"
@@ -106,13 +146,11 @@ echo
 mkdir -p "$WORK"
 : > "$WORK/drives.list"
 
-# Header
 printf '  %-4s %-14s %-10s %s\n' "NUM" "DEVICE" "SIZE" "MODEL"
 printf '  %-4s %-14s %-10s %s\n' "---" "------" "----" "-----"
 
-# Find the device backing / so we can flag/refuse it
+# Identify root device to flag/refuse it
 ROOTSRC=$(awk '$2=="/"{print $1; exit}' /proc/mounts 2>/dev/null || true)
-# strip partition suffix to get parent disk name
 ROOTDISK=""
 if [ -n "$ROOTSRC" ]; then
     rn=$(basename "$ROOTSRC")
@@ -123,7 +161,7 @@ if [ -n "$ROOTSRC" ]; then
 fi
 
 i=1
-lsblk -dn -o NAME,SIZE,TYPE,MODEL 2>/dev/null > "$WORK/lsblk.out"
+lsblk -dn -o NAME,SIZE,TYPE,MODEL 2>/dev/null > "$WORK/disks.raw"
 while IFS= read -r line; do
     name=$(echo  "$line" | awk '{print $1}')
     size=$(echo  "$line" | awk '{print $2}')
@@ -131,14 +169,12 @@ while IFS= read -r line; do
     model=$(echo "$line" | awk '{for(j=4;j<=NF;j++) printf "%s ",$j; print ""}')
     [ "$type" = "disk" ] || continue
     case "$name" in loop*|sr*|zram*|fd*|ram*) continue ;; esac
-
     flag=""
     [ "$name" = "$ROOTDISK" ] && flag=" (LIVE/IN-USE)"
-
     printf '  %-4s %-14s %-10s %s%s\n' "$i" "/dev/$name" "$size" "$model" "$flag"
     echo "/dev/$name" >> "$WORK/drives.list"
     i=$((i+1))
-done < "$WORK/lsblk.out"
+done < "$WORK/disks.raw"
 
 echo
 [ -s "$WORK/drives.list" ] || die "no drives detected"
@@ -149,18 +185,14 @@ read sel
 
 case "$sel" in
     q|Q) info "cancelled"; exit 0 ;;
-    '')        die "empty selection" ;;
-    *[!0-9]*)  die "not a number: $sel" ;;
+    '') die "empty selection" ;;
+    *[!0-9]*) die "not a number: $sel" ;;
 esac
-
-if [ "$sel" -lt 1 ] || [ "$sel" -gt "$count" ]; then
-    die "selection $sel out of range (1-$count)"
-fi
+[ "$sel" -ge 1 ] && [ "$sel" -le "$count" ] || die "selection $sel out of range"
 
 DRIVE=$(sed -n "${sel}p" "$WORK/drives.list")
 [ -b "$DRIVE" ] || die "$DRIVE is not a block device"
 
-# Refuse the live drive
 DRIVE_NAME=$(basename "$DRIVE")
 [ "$DRIVE_NAME" = "$ROOTDISK" ] && die "$DRIVE is the live/running drive — refusing"
 
@@ -197,16 +229,12 @@ read ans
 # ---- step 3: execute ------------------------------------------
 banner "Step 3 of 3: Preparing $DRIVE"
 
-# Unmount anything currently on this drive
-if mount | grep -q "^${DRIVE}"; then
+if grep -q "^${DRIVE}" /proc/mounts; then
     info "unmounting existing partitions on $DRIVE"
-    mount | awk -v d="$DRIVE" '$1 ~ "^"d {print $3}' | sort -r \
-        | while read mp; do
-            umount -lf "$mp" 2>/dev/null || true
-        done
+    awk -v d="$DRIVE" '$1 ~ "^"d {print $2}' /proc/mounts | sort -r \
+        | while read mp; do umount -lf "$mp" 2>/dev/null || true; done
 fi
 
-# Disable swap on this drive
 if grep -q "^${DRIVE}" /proc/swaps 2>/dev/null; then
     for s in $(awk -v d="$DRIVE" '$1 ~ "^"d {print $1}' /proc/swaps); do
         info "swapoff $s"
@@ -217,7 +245,7 @@ fi
 info "wiping existing signatures"
 wipefs -a "$DRIVE" >/dev/null
 
-info "creating GPT + ${EFI_SIZE_MIB}M EFI + BTRFS partitions"
+info "creating GPT + ${EFI_SIZE_MIB}M EFI + BTRFS"
 parted -s "$DRIVE" \
     mklabel gpt \
     mkpart ESP fat32 1MiB "${EFI_SIZE_MIB}MiB" \
@@ -227,14 +255,12 @@ parted -s "$DRIVE" \
 partprobe "$DRIVE" >/dev/null 2>&1 || true
 sleep 2
 
-# Partition naming: nvme/mmc use pN; sd/vd/hd use plain N
 case "$DRIVE" in
     *nvme*|*mmcblk*|*loop*) EFI_PART="${DRIVE}p1"; ROOT_PART="${DRIVE}p2" ;;
     *)                      EFI_PART="${DRIVE}1";  ROOT_PART="${DRIVE}2"  ;;
 esac
-
-[ -b "$EFI_PART"  ] || die "EFI partition $EFI_PART not visible after partprobe"
-[ -b "$ROOT_PART" ] || die "BTRFS partition $ROOT_PART not visible after partprobe"
+[ -b "$EFI_PART"  ] || die "EFI partition $EFI_PART not visible"
+[ -b "$ROOT_PART" ] || die "BTRFS partition $ROOT_PART not visible"
 
 info "formatting $EFI_PART as FAT32"
 mkfs.vfat -F32 -n EFI "$EFI_PART" >/dev/null
@@ -250,16 +276,13 @@ for sv in $SUBVOLS; do
     echo "    + $sv"
 done
 
-# Set @ as the default subvolume so Timeshift behaves
 DEFAULT_ID=$(btrfs subvolume list "$WORK/mnt" | awk '/path @$/{print $2; exit}')
 if [ -n "${DEFAULT_ID:-}" ]; then
     btrfs subvolume set-default "$DEFAULT_ID" "$WORK/mnt"
     info "set @ (id $DEFAULT_ID) as default subvolume"
 fi
-
 umount "$WORK/mnt"
 
-# Capture UUIDs for the post-install fstab fix
 EFI_UUID=$(blkid  -s UUID -o value "$EFI_PART")
 ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
 
@@ -271,7 +294,6 @@ EFI_UUID=$EFI_UUID
 ROOT_UUID=$ROOT_UUID
 EOF
 
-# Pre-build the fstab the user will need post-install
 OPTS="defaults,noatime,compress=zstd:3,space_cache=v2"
 cat > "$WORK/fstab.snippet" <<EOF
 # Timeshift-compatible BTRFS layout — generated by btrfs-timeshift-wizard.sh
@@ -286,7 +308,6 @@ UUID=$ROOT_UUID  /.snapshots    btrfs  ${OPTS},subvol=@snapshots  0 0
 UUID=$EFI_UUID   /boot/efi      vfat   umask=0077,shortname=winnt 0 1
 EOF
 
-# ---- done -----------------------------------------------------
 cat <<EOF
 
 ================================================================
@@ -297,17 +318,15 @@ cat <<EOF
   BTRFS root:      $ROOT_PART  UUID=$ROOT_UUID
   Subvolumes:      $SUBVOLS
 
-  State saved to:  $STATE
+  State saved:     $STATE
   fstab snippet:   $WORK/fstab.snippet
 
   ---------------------------------------------------------------
   NEXT STEPS
   ---------------------------------------------------------------
-  1) Press Alt-F1 to return to the Debian installer.
+  1) Press Alt-F1 to return to the installer.
 
-  2) When the partitioner runs (or re-run it from the menu):
-     - Choose:  Manual partitioning
-     - You will see the existing partitions on $DRIVE.
+  2) In "Partition disks" choose Manual partitioning.
 
      For $EFI_PART:
         Use as:           EFI System Partition
@@ -319,23 +338,16 @@ cat <<EOF
         Mount point:      /
         Mount options:    noatime
         Format:           NO (do not reformat)
-        ** subvol=@ is set as the DEFAULT subvolume, so the
-        installer will land on @ automatically. **
 
-  3) Continue install. When base install finishes and the installer
-     offers to reboot, instead choose:
-        "Execute a shell in the installer environment"
-     ...and run the post-install fstab step:
+  3) When base install completes and the installer offers reboot,
+     instead choose "Execute a shell" and run:
 
-        sh btrfs-timeshift-wizard.sh fixfstab
+        sh /path/to/btrfs-timeshift-wizard.sh fixfstab
 
-     That copies the full Timeshift fstab into /target/etc/fstab,
-     so /home, /var/log, /.snapshots etc. all mount correctly.
+     That writes /target/etc/fstab with the full subvolume layout.
 
-  4) Exit shell, finish install, reboot. After first boot:
+  4) Exit shell, finish install, reboot. Then:
         sudo apt install -y timeshift
-        sudo timeshift-launcher
-        -> choose BTRFS mode. Done.
+        sudo timeshift --btrfs --create --comments "baseline"
 ================================================================
 EOF
-
