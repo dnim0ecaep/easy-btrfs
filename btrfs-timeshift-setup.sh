@@ -266,3 +266,4 @@ printf "  1. Ctrl+Alt+F1 to return to the installer\n"
 printf "  2. Let the installer finish\n"
 printf "  3. After first boot: install timeshift, select BTRFS mode\n"
 echo ""
+
