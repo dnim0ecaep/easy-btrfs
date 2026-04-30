@@ -173,25 +173,39 @@ fi
 mount -o subvolid=5 "$BTRFS" /mnt || die "mount $BTRFS /mnt failed"
 ok "mount -o subvolid=5 $BTRFS /mnt"
 
-info "Contents of /mnt:"
-ls /mnt | sed 's/^/  /'
+info "Contents of /mnt (top-level):"
+ls -la /mnt | sed 's/^/  /'
 echo ""
 
 info "Subvolumes on $BTRFS:"
 btrfs subvolume list /mnt | sed 's/^/  /'
 echo ""
 
-# mv @rootfs/ @  (slide 1)
-if [ -d /mnt/@rootfs ] && [ ! -d /mnt/@ ]; then
+# Figure out what the installer called the root subvolume
+# It could be @rootfs, @, or something else entirely
+if [ -d /mnt/@ ]; then
+    ok "@ already exists — skipping rename"
+
+elif [ -d /mnt/@rootfs ]; then
     mv /mnt/@rootfs /mnt/@ || die "mv @rootfs @ failed"
     ok "mv @rootfs/ @"
-elif [ -d /mnt/@ ]; then
-    warn "@ already exists — skipping mv"
-    [ -d /mnt/@rootfs ] && warn "@rootfs also still present — you may delete it later"
+
 else
-    warn "Contents of /mnt:"
-    ls -la /mnt | sed 's/^/  /'
-    die "No @rootfs or @ found — mount may not be showing top-level BTRFS"
+    # Installer may have used a different name — show what's there and ask
+    warn "Did not find @rootfs or @ in /mnt"
+    warn "Directories found in /mnt:"
+    ls -1 /mnt | sed 's/^/    /'
+    echo ""
+    warn "Enter the name of the root subvolume shown above (e.g. @rootfs or @):"
+    printf "${CYN}Subvolume name: ${RST}"; read -r SVNAME
+    SVNAME=$(echo "$SVNAME" | sed 's|^/mnt/||; s|/$||')
+    [ -d "/mnt/$SVNAME" ] || die "/mnt/$SVNAME does not exist"
+    if [ "$SVNAME" = "@" ]; then
+        ok "Already named @ — nothing to rename"
+    else
+        mv "/mnt/$SVNAME" /mnt/@ || die "mv $SVNAME -> @ failed"
+        ok "Renamed $SVNAME -> @"
+    fi
 fi
 
 # btrfs su cr @home @root @log @tmp @opt  (slide 1)
@@ -299,3 +313,4 @@ printf "  ${BLD}%-8s${RST} %s  (UUID: %s)\n" "EFI:"    "$EFI"   "$EUUID"
 echo ""
 warn "Press Ctrl+Alt+F1 to return to the installer, then let it finish."
 echo ""
+
