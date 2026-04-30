@@ -140,12 +140,16 @@ if is_mounted /mnt; then
     umount /mnt 2>/dev/null || umount -l /mnt 2>/dev/null || true
 fi
 
-# mount /dev/nvmeXnXpX /mnt  (slide 1)
-mount "$BTRFS" /mnt || die "mount $BTRFS /mnt failed"
-ok "mount $BTRFS /mnt"
+# mount top-level BTRFS volume (subvolid=5 gives the real root, not a subvol)
+mount -o subvolid=5 "$BTRFS" /mnt || die "mount $BTRFS /mnt failed"
+ok "mount -o subvolid=5 $BTRFS /mnt"
 
 info "Contents of /mnt:"
 ls /mnt | sed 's/^/  /'
+echo ""
+
+info "Subvolumes on $BTRFS:"
+btrfs subvolume list /mnt | sed 's/^/  /'
 echo ""
 
 # mv @rootfs/ @  (slide 1)
@@ -154,9 +158,11 @@ if [ -d /mnt/@rootfs ] && [ ! -d /mnt/@ ]; then
     ok "mv @rootfs/ @"
 elif [ -d /mnt/@ ]; then
     warn "@ already exists — skipping mv"
+    [ -d /mnt/@rootfs ] && warn "@rootfs also still present — you may delete it later"
 else
-    ls /mnt
-    die "No @rootfs found on $BTRFS — wrong partition?"
+    warn "Contents of /mnt:"
+    ls -la /mnt | sed 's/^/  /'
+    die "No @rootfs or @ found — mount may not be showing top-level BTRFS"
 fi
 
 # btrfs su cr @home @root @log @tmp @opt  (slide 1)
@@ -264,4 +270,3 @@ printf "  ${BLD}%-8s${RST} %s  (UUID: %s)\n" "EFI:"    "$EFI"   "$EUUID"
 echo ""
 warn "Press Ctrl+Alt+F1 to return to the installer, then let it finish."
 echo ""
-
