@@ -59,8 +59,20 @@ human_size() {
 
 # ── Sanity ────────────────────────────────────────────────────────────────────
 [ "$(id -u)" -eq 0 ] || die "Must run as root"
-command -v btrfs  >/dev/null 2>&1 || die "btrfs command not found"
-command -v blkid  >/dev/null 2>&1 || die "blkid command not found"
+command -v btrfs >/dev/null 2>&1 || die "btrfs not found"
+
+# blkid location varies in installer — search common paths
+BLKID=""
+for TRY in blkid /sbin/blkid /usr/sbin/blkid /bin/blkid; do
+    if "$TRY" --version >/dev/null 2>&1 || "$TRY" -h >/dev/null 2>&1; then
+        BLKID="$TRY"
+        break
+    fi
+done
+[ -n "$BLKID" ] || die "blkid not found - check /sbin/blkid exists"
+
+get_uuid() { "$BLKID" -s UUID -o value "$1" 2>/dev/null; }
+get_type() { "$BLKID" -s TYPE -o value "$1" 2>/dev/null; }
 
 # =============================================================================
 #  STEP 1 — Show all whole drives with sizes
@@ -110,7 +122,7 @@ while read -r MAJ MIN BLOCKS NAME; do
     DEV="/dev/${NAME}"
     [ -b "$DEV" ] || continue
     SIZE=$(human_size "$BLOCKS")
-    FSTYPE=$(blkid -s TYPE  -o value "$DEV" 2>/dev/null || true)
+    FSTYPE=$(get_type "$DEV")
     printf "    %-16s %-8s %s\n" "$DEV" "$SIZE" "${FSTYPE:--}"
 done < /proc/partitions
 echo ""
@@ -161,7 +173,7 @@ info "BTRFS partition: $BTRFS_PART"
 [ -b "$BTRFS_PART" ] || die "BTRFS partition $BTRFS_PART not found."
 
 # Warn if BTRFS partition doesn't look like btrfs
-BTRFS_FSTYPE=$(blkid -s TYPE -o value "$BTRFS_PART" 2>/dev/null || true)
+BTRFS_FSTYPE=$(get_type "$BTRFS_PART")
 if [ "$BTRFS_FSTYPE" != "btrfs" ]; then
     warn "$BTRFS_PART has type '${BTRFS_FSTYPE:-unknown}' — expected btrfs"
     warn "Make sure you selected BTRFS as the filesystem during the Debian install"
@@ -274,8 +286,8 @@ ok "EFI  -> /target/boot/efi"
 # =============================================================================
 header "STEP 7 — Writing /target/etc/fstab"
 
-BTRFS_UUID=$(blkid -s UUID -o value "$BTRFS_PART" 2>/dev/null)
-EFI_UUID=$(blkid   -s UUID -o value "$EFI_PART"   2>/dev/null)
+BTRFS_UUID=$(get_uuid "$BTRFS_PART")
+EFI_UUID=$(get_uuid   "$EFI_PART")
 
 [ -n "$BTRFS_UUID" ] || die "Could not get UUID for $BTRFS_PART"
 [ -n "$EFI_UUID"   ] || die "Could not get UUID for $EFI_PART"
