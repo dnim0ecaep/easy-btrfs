@@ -39,45 +39,105 @@ command -v btrfs >/dev/null 2>&1 || die "'btrfs' not found. Is btrfs-progs insta
 command -v blkid >/dev/null 2>&1 || die "'blkid' not found"
 
 # ── STEP 1: Show drives ───────────────────────────────────────────────────────
-header "STEP 1 — Available block devices"
+header "STEP 1 — Available drives and partitions"
 echo ""
 
-echo "  /proc/partitions:"
-echo "  -------------------------------------------"
-cat /proc/partitions
+# Build a clean numbered list from /proc/partitions + blkid
+# /proc/partitions columns: major minor #blocks name
+# We skip whole disks (no digit at end of name after letters) and
+# the ramdisk/loop/cdrom entries, keeping only real partitions
+
+printf "  ${BLD}%-4s %-16s %-10s %-10s %-36s${RST}\n" \
+    "Num" "Device" "Size" "Type" "UUID / Label"
+printf "  %s\n" "-----------------------------------------------------------------------"
+
+IDX=0
+PART_LIST=""   # newline-separated: "idx|device|size|type"
+
+while read -r MAJ MIN BLOCKS NAME; do
+    # Skip header line and blank lines
+    echo "$NAME" | grep -qE '^[a-z]' || continue
+    # Skip whole disks (sda, nvme0n1 etc — no trailing digit after letters+digits pattern)
+    # A partition always ends in a digit AND has a parent disk
+    echo "$NAME" | grep -qE '[0-9]$' || continue
+    # Skip loop, ram, sr devices
+    echo "$NAME" | grep -qE '^(loop|ram|sr)' && continue
+
+    DEV="/dev/${NAME}"
+    [ -b "$DEV" ] || continue
+
+    # Size: blocks are 1K, convert to human readable
+    KBLOCKS="$BLOCKS"
+    if [ "$KBLOCKS" -ge 1073741824 ] 2>/dev/null; then
+        SIZE="$(( KBLOCKS / 1073741824 ))T"
+    elif [ "$KBLOCKS" -ge 1048576 ] 2>/dev/null; then
+        SIZE="$(( KBLOCKS / 1048576 ))G"
+    elif [ "$KBLOCKS" -ge 1024 ] 2>/dev/null; then
+        SIZE="$(( KBLOCKS / 1024 ))M"
+    else
+        SIZE="${KBLOCKS}K"
+    fi
+
+    TYPE=$(blkid -s TYPE  -o value "$DEV" 2>/dev/null || true)
+    UUID=$(blkid -s UUID  -o value "$DEV" 2>/dev/null || true)
+    LABEL=$(blkid -s LABEL -o value "$DEV" 2>/dev/null || true)
+
+    EXTRA="${UUID}"
+    [ -n "$LABEL" ] && EXTRA="${LABEL} (${UUID})"
+
+    IDX=$(( IDX + 1 ))
+    printf "  ${CYN}%-4s${RST} %-16s %-10s %-10s %-36s\n" \
+        "$IDX" "$DEV" "$SIZE" "${TYPE:--}" "${EXTRA:--}"
+
+    PART_LIST="${PART_LIST}${IDX}|${DEV}|${SIZE}|${TYPE}
+"
+done < /proc/partitions
+
 echo ""
 
-echo "  Partition types (blkid):"
-echo "  -------------------------------------------"
-blkid 2>/dev/null || true
-echo ""
+if [ "$IDX" -eq 0 ]; then
+    warn "No partitions detected via /proc/partitions — showing raw fdisk output instead:"
+    fdisk -l 2>/dev/null || true
+    echo ""
+fi
 
-echo "  Currently mounted (df -h):"
-echo "  -------------------------------------------"
-df -h 2>/dev/null || true
-echo ""
-
-echo "  Disk layout (fdisk -l):"
-echo "  -------------------------------------------"
-fdisk -l 2>/dev/null || true
-echo ""
+# Helper: look up device by number from PART_LIST
+get_part_by_num() {
+    NUM="$1"
+    echo "$PART_LIST" | while IFS='|' read -r I DEV SZ TY; do
+        [ "$I" = "$NUM" ] && printf "%s" "$DEV" && break
+    done
+}
 
 # ── STEP 2: Choose partitions ────────────────────────────────────────────────
 header "STEP 2 — Select partitions"
 echo ""
-echo "  Look at the output above."
-echo "  Your BTRFS partition is the large one (type 'Linux filesystem')."
-echo "  Your EFI partition is the small ~500MB one (type 'EFI System')."
+echo "  Enter the NUMBER from the list above, or type the full device path."
+echo "  BTRFS partition = the large one with type 'btrfs'"
+echo "  EFI partition   = the small ~500M one with type 'vfat'"
 echo ""
 
 # BTRFS partition
 BTRFS_PART=""
 while true; do
-    printf "${CYN}Enter BTRFS root partition (e.g. /dev/nvme0n1p2 or /dev/sda2): ${RST}"
-    read -r BTRFS_PART
-    BTRFS_PART="${BTRFS_PART%/}"
+    printf "${CYN}BTRFS root partition (number or path): ${RST}"
+    read -r INPUT
+    INPUT="${INPUT%/}"
+
+    # If numeric, resolve to device
+    if echo "$INPUT" | grep -qE '^[0-9]+$'; then
+        BTRFS_PART=$(get_part_by_num "$INPUT")
+        if [ -z "$BTRFS_PART" ]; then
+            warn "No partition with number $INPUT — try again"
+            continue
+        fi
+        info "Selected: $BTRFS_PART"
+    else
+        BTRFS_PART="$INPUT"
+    fi
+
     if [ ! -b "$BTRFS_PART" ]; then
-        warn "Not a valid block device: $BTRFS_PART  -- try again"
+        warn "Not a valid block device: $BTRFS_PART — try again"
         continue
     fi
     FSTYPE=$(blkid -s TYPE -o value "$BTRFS_PART" 2>/dev/null || true)
@@ -93,11 +153,23 @@ done
 # EFI partition
 EFI_PART=""
 while true; do
-    printf "${CYN}Enter EFI partition (e.g. /dev/nvme0n1p1 or /dev/sda1): ${RST}"
-    read -r EFI_PART
-    EFI_PART="${EFI_PART%/}"
+    printf "${CYN}EFI partition (number or path): ${RST}"
+    read -r INPUT
+    INPUT="${INPUT%/}"
+
+    if echo "$INPUT" | grep -qE '^[0-9]+$'; then
+        EFI_PART=$(get_part_by_num "$INPUT")
+        if [ -z "$EFI_PART" ]; then
+            warn "No partition with number $INPUT — try again"
+            continue
+        fi
+        info "Selected: $EFI_PART"
+    else
+        EFI_PART="$INPUT"
+    fi
+
     if [ ! -b "$EFI_PART" ]; then
-        warn "Not a valid block device: $EFI_PART  -- try again"
+        warn "Not a valid block device: $EFI_PART — try again"
         continue
     fi
     break
@@ -288,3 +360,4 @@ printf "  2. Finish the Debian installation normally\n"
 printf "  3. After first boot, install Timeshift, select BTRFS mode\n"
 printf "     (auto-detects @, @home, @root, @log, @tmp, @opt)\n"
 echo ""
+
